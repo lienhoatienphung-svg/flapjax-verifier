@@ -29,7 +29,7 @@ class TestFlapJaxVerifier(unittest.TestCase):
 
     def test_04_two_percent_depth_formula_and_sqrt_ratio(self):
         liq = 320678316678999036604866
-        sqrt_p = 5249004968937877293685143
+        sqrt_p = 1627163852510051447001980
         depth = fv.compute_two_percent_wbnb_depth(liq, sqrt_p)
         self.assertAlmostEqual(depth, 0.06564, places=4)
 
@@ -49,11 +49,12 @@ class TestFlapJaxVerifier(unittest.TestCase):
     def test_06_live_goplus_locker_locks_101(self):
         data = "0xf4dadc61" + hex(101)[2:].rjust(64, "0")
         res = fv.rpc_call("eth_call", [{"to": fv.GOPLUS_LOCKER, "data": data}, "latest"])
-        clean = res[2:]
-        nft_id = int(clean[64:128], 16)
-        end_time = int(clean[320:384], 16)
-        self.assertEqual(nft_id, 1456181)
-        self.assertEqual(end_time, 2048764401)
+        decoded = fv.decode_goplus_lock(res)
+        self.assertEqual(decoded["lockId"], 101)
+        self.assertEqual(decoded["nftPositionManager"], fv.NFPM)
+        self.assertEqual(decoded["pool"], fv.POOL_V3_WBNB)
+        self.assertEqual(decoded["nftId"], 1456181)
+        self.assertEqual(decoded["endTime"], 2048764401)
 
     def test_07_live_erc8004_dispatcher_31_selectors(self):
         code = fv.rpc_call("eth_getCode", [fv.ERC8004_IMPL, "latest"])
@@ -84,6 +85,15 @@ class TestFlapJaxVerifier(unittest.TestCase):
         first = fv.ARISPAY_SETTLED_RECEIPTS[0]
         tampered = fv.verify_transfer_receipt(first["tx"], fv.ARISPAY_WALLET, first["amount_fj"] * (10**18) + 1)
         self.assertFalse(tampered["valid"])
+
+    def test_11_arbitrary_wallet_and_custom_tx_list(self):
+        # Verify an arbitrary buyback tx where Treasury is recipient without hardcoding expected amount
+        buyback_tx = fv.VERIFIED_BUYBACKS[-1]["tx"]
+        res = fv.verify_wallet_and_txs(wallet=fv.TREASURY, tx_list=[buyback_tx])
+        self.assertEqual(res["wallet"], fv.TREASURY)
+        self.assertEqual(res["receipts_checked"], 1)
+        self.assertTrue(res["all_valid"])
+        self.assertGreater(res["total_verified_fj"], 0)
 
 
 if __name__ == "__main__":
