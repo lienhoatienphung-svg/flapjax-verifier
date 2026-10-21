@@ -128,8 +128,6 @@ def decode_signed_24(word_hex):
     val = int(word_hex, 16)
     if val >= (1 << 255):
         val -= (1 << 256)
-    if val >= (1 << 23):
-        val -= (1 << 24)
     return val
 
 
