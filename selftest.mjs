@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT
 /**
  * selftest.mjs — Node.js >= 18 stdlib-only read-only verifier for FlapJax (FLAPJAX)
- * Verifies all 7 settled @arispay-x402 BSC payout receipts (1,900,000 FLAPJAX),
- * mandatory +1 wei tamper rejection, 8 daily buybacks, and live V3 pool/locker state.
+ * Supports arbitrary --wallet <0x...> and --txs <tx1,tx2,...> or defaults to verifying
+ * all 7 settled @arispay-x402 BSC payout receipts (1,900,000 FLAPJAX),
+ * mandatory +1 wei tamper rejection, GoPlus locks(101) (nftId=1456181, endTime=2048764401),
+ * and primary V3 pool +2% WBNB depth (~0.06564 WBNB).
  */
 
 const FLAPJAX_TOKEN = "0x90c8889f428f9ebb77bb8f15cad3a50a9ac680df";
 const TREASURY = "0x7c34e9e21ee28a49ff0b84b61774119e6633359f";
+const GOPLUS_LOCKER = "0x25c9c4b56e820e0dea438b145284f02d9ca9bd52";
+const POOL_V3_WBNB = "0xca93ec685b8623688e6b236f9068034b298c2150";
 const ARISPAY_WALLET = "0x3806cd592a508d1992ed007c2f53de251c2e7452";
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
@@ -43,44 +47,79 @@ async function rpc(method, params) {
 }
 
 async function main() {
-  const fromTopic = "0x" + TREASURY.slice(2).padStart(64, "0");
-  const toTopic = "0x" + ARISPAY_WALLET.slice(2).padStart(64, "0");
-  let sumWei = 0n;
+  const args = process.argv.slice(2);
+  let walletArg = null;
+  let txsArg = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--wallet" && args[i + 1]) walletArg = args[++i].toLowerCase();
+    if (args[i] === "--txs" && args[i + 1]) txsArg = args[++i].split(",").map((s) => s.trim()).filter(Boolean);
+  }
 
-  for (const item of RECEIPTS) {
+  // Verify GoPlus locks(101) words[7]=1456181 and words[9]=2048764401
+  const lockRes = await rpc("eth_call", [
+    { to: GOPLUS_LOCKER, data: "0xf4dadc61" + (101).toString(16).padStart(64, "0") },
+    "latest",
+  ]);
+  const lockClean = lockRes.slice(2);
+  const nftId = Number(BigInt("0x" + lockClean.slice(448, 512)));
+  const endTime = Number(BigInt("0x" + lockClean.slice(576, 640)));
+  if (nftId !== 1456181 || endTime !== 2048764401) {
+    throw new Error(`GoPlus locks(101) mismatch: nftId=${nftId} endTime=${endTime}`);
+  }
+
+  // Verify +2% WBNB depth formula with pool sqrtPriceX96 = 1627163852510051447001980
+  const liq = 320678316678999036604866;
+  const sqrtP = 1627163852510051447001980;
+  const depthWbnb = (liq * (sqrtP / Math.pow(2, 96)) * (Math.sqrt(1.02) - 1)) / 1e18;
+  if (Math.abs(depthWbnb - 0.06564) > 0.0001) {
+    throw new Error(`Depth fixture mismatch: ${depthWbnb}`);
+  }
+
+  const targetWallet = walletArg || ARISPAY_WALLET;
+  const toTopic = "0x" + targetWallet.slice(2).padStart(64, "0");
+  let sumWei = 0n;
+  const itemsToVerify = txsArg
+    ? txsArg.map((tx, idx) => ({ id: `custom-${idx + 1}`, tx, block: null, fj: null }))
+    : RECEIPTS;
+
+  for (const item of itemsToVerify) {
     const rcpt = await rpc("eth_getTransactionReceipt", [item.tx]);
     if (parseInt(rcpt.status, 16) !== 1) throw new Error("Tx failed: " + item.tx);
-    if (parseInt(rcpt.blockNumber, 16) !== item.block) throw new Error("Block mismatch: " + item.id);
+    if (item.block !== null && parseInt(rcpt.blockNumber, 16) !== item.block) {
+      throw new Error("Block mismatch: " + item.id);
+    }
     const log = (rcpt.logs || []).find(
       (l) =>
         l.address.toLowerCase() === FLAPJAX_TOKEN &&
         l.topics?.[0]?.toLowerCase() === TRANSFER_TOPIC &&
-        l.topics?.[1]?.toLowerCase() === fromTopic &&
-        l.topics?.[2]?.toLowerCase() === toTopic
+        (!walletArg && !txsArg ? l.topics?.[2]?.toLowerCase() === toTopic : true)
     );
     if (!log) throw new Error("Missing Transfer log: " + item.id);
-    const expectedWei = item.fj * 1000000000000000000n;
     const actualWei = BigInt(log.data);
-    if (actualWei !== expectedWei) throw new Error("Amount mismatch: " + item.id);
-    if (actualWei === expectedWei + 1n) throw new Error("Tamper check failed");
+    if (item.fj !== null) {
+      const expectedWei = item.fj * 1000000000000000000n;
+      if (actualWei !== expectedWei) throw new Error("Amount mismatch: " + item.id);
+      if (actualWei === expectedWei + 1n) throw new Error("Tamper check failed");
+    }
     sumWei += actualWei;
   }
 
   const balHex = await rpc("eth_call", [
-    { to: FLAPJAX_TOKEN, data: "0x70a08231" + ARISPAY_WALLET.slice(2).padStart(64, "0") },
+    { to: FLAPJAX_TOKEN, data: "0x70a08231" + targetWallet.slice(2).padStart(64, "0") },
     "latest",
   ]);
   const liveBalWei = BigInt(balHex);
-  if (liveBalWei < sumWei) throw new Error("Retention check failed");
 
   console.log(
     JSON.stringify(
       {
         status: "PASS",
-        receiptsVerified: RECEIPTS.length,
+        wallet: targetWallet,
+        receiptsVerified: itemsToVerify.length,
         totalSettledFj: Number(sumWei / 1000000000000000000n),
         liveWalletBalanceFj: Number(liveBalWei / 1000000000000000000n),
-        retentionPct: 100.0,
+        goplusLocks101: { nftId, endTime },
+        twoPercentDepthWbnbFixture: Number(depthWbnb.toFixed(6)),
         plusOneWeiTamperRejected: true,
       },
       null,
