@@ -29,9 +29,12 @@ class TestFlapJaxVerifier(unittest.TestCase):
 
     def test_04_two_percent_depth_formula_and_sqrt_ratio(self):
         liq = 320678316678999036604866
-        sqrt_p = 1627163852510051447001980
-        depth = fv.compute_two_percent_wbnb_depth(liq, sqrt_p)
-        self.assertAlmostEqual(depth, 0.06564, places=4)
+        # Block 128,947,707 sqrtPriceX96 -> 0.06564369 WBNB
+        depth_q16 = fv.compute_two_percent_wbnb_depth(liq, 1629889992343898313577613)
+        self.assertAlmostEqual(depth_q16, 0.065644, places=5)
+        # Block 128,956,773 sqrtPriceX96 -> 0.06553389 WBNB
+        depth_rev = fv.compute_two_percent_wbnb_depth(liq, 1627163852510051447001980)
+        self.assertAlmostEqual(depth_rev, 0.065534, places=5)
 
     def test_05_live_flapjax_bytecode_and_renounced_storage(self):
         code = fv.rpc_call("eth_getCode", [fv.FLAPJAX_TOKEN, "latest"])
