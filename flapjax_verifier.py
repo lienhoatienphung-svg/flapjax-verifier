@@ -4,7 +4,7 @@
 flapjax_verifier.py — Zero-dependency, 100% read-only BNB Smart Chain verifier
 for the FlapJax (FLAPJAX) token, treasury, PancakeSwap V3 pools (WBNB & BTCB),
 NFPM positions, GoPlus UniV3LPLocker, ERC-8004 Identity Registry bytecode,
-and settled treasury payout receipts.
+and arbitrary wallet / transaction list payout receipts.
 
 Uses ONLY Python 3 standard library (urllib.request, json, hashlib, math, argparse).
 No private keys, no wallet signing, no external packages.
@@ -105,7 +105,7 @@ def rpc_call(method, params, rpc_url=None):
             req = urllib.request.Request(
                 url,
                 data=payload,
-                headers={"Content-Type": "application/json", "User-Agent": "flapjax-verifier/1.0"},
+                headers={"Content-Type": "application/json", "User-Agent": "flapjax-verifier/1.1"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=12) as resp:
@@ -138,33 +138,101 @@ def decode_slot0(slot0_hex):
     return {"sqrtPriceX96": sqrt_price_x96, "tick": tick}
 
 
+def decode_goplus_lock(res_hex):
+    clean = res_hex[2:] if res_hex.startswith("0x") else res_hex
+    words = [clean[i : i + 64] for i in range(0, len(clean), 64)]
+    return {
+        "lockId": int(words[0], 16),
+        "nftPositionManager": "0x" + words[1][-40:].lower(),
+        "pool": "0x" + words[5][-40:].lower(),
+        "nftId": int(words[7], 16),
+        "startTime": int(words[8], 16),
+        "endTime": int(words[9], 16),
+    }
+
+
 def compute_two_percent_wbnb_depth(liquidity, sqrt_price_x96):
     q96 = 1 << 96
     return (liquidity * sqrt_price_x96 / q96) * (math.sqrt(1.02) - 1.0) / 1e18
 
 
-def verify_transfer_receipt(tx_hash, expected_to, expected_amount_wei, rpc_url=None):
+def verify_transfer_receipt(tx_hash, expected_to=None, expected_amount_wei=None, rpc_url=None):
     rcpt = rpc_call("eth_getTransactionReceipt", [tx_hash], rpc_url)
     if not rcpt or int(rcpt.get("status", "0x0"), 16) != 1:
         return {"valid": False, "reason": "receipt_status_not_1"}
-    expected_from_topic = "0x" + TREASURY.lower().replace("0x", "").rjust(64, "0")
-    expected_to_topic = "0x" + expected_to.lower().replace("0x", "").rjust(64, "0")
+    expected_to_topic = (
+        "0x" + expected_to.lower().replace("0x", "").rjust(64, "0")
+        if expected_to
+        else None
+    )
     for log in rcpt.get("logs", []):
         if (
             log.get("address", "").lower() == FLAPJAX_TOKEN
             and len(log.get("topics", [])) >= 3
             and log["topics"][0].lower() == TRANSFER_TOPIC
-            and log["topics"][1].lower() == expected_from_topic
-            and log["topics"][2].lower() == expected_to_topic
         ):
+            from_addr = "0x" + log["topics"][1][-40:].lower()
+            to_addr = "0x" + log["topics"][2][-40:].lower()
+            if expected_to_topic and log["topics"][2].lower() != expected_to_topic:
+                continue
             actual_wei = int(log.get("data", "0x0"), 16)
+            amount_ok = (expected_amount_wei is None) or (actual_wei == expected_amount_wei)
             return {
-                "valid": actual_wei == expected_amount_wei,
+                "valid": amount_ok,
                 "blockNumber": int(rcpt["blockNumber"], 16),
+                "from": from_addr,
+                "to": to_addr,
+                "from_treasury": from_addr == TREASURY,
                 "actual_wei": actual_wei,
-                "expected_wei": expected_amount_wei,
+                "actual_fj": actual_wei / 1e18,
+                "expected_wei": expected_amount_wei if expected_amount_wei is not None else actual_wei,
             }
     return {"valid": False, "reason": "matching_transfer_log_not_found"}
+
+
+def verify_wallet_and_txs(wallet=None, tx_list=None, rpc_url=None):
+    target_wallet = wallet.lower() if wallet else None
+    results = []
+    total_verified_wei = 0
+
+    if tx_list:
+        for idx, item in enumerate(tx_list):
+            if isinstance(item, dict):
+                tx_hash = item["tx"]
+                exp_wei = int(item["amount_fj"] * (10**18)) if "amount_fj" in item else item.get("expected_wei")
+                label = item.get("bounty", f"tx-{idx+1}")
+            else:
+                tx_hash = str(item).strip()
+                exp_wei = None
+                label = f"tx-{idx+1}"
+            chk = verify_transfer_receipt(tx_hash, target_wallet, exp_wei, rpc_url)
+            if not target_wallet and chk.get("to"):
+                target_wallet = chk["to"]
+            results.append({"label": label, "tx": tx_hash, **chk})
+            if chk.get("valid"):
+                total_verified_wei += chk.get("actual_wei", 0)
+    elif not target_wallet or target_wallet == ARISPAY_WALLET:
+        target_wallet = ARISPAY_WALLET
+        for item in ARISPAY_SETTLED_RECEIPTS:
+            chk = verify_transfer_receipt(item["tx"], target_wallet, item["amount_fj"] * (10**18), rpc_url)
+            results.append({**item, **chk})
+            if chk.get("valid"):
+                total_verified_wei += chk.get("actual_wei", 0)
+
+    target_wallet = target_wallet or ARISPAY_WALLET
+    bal_wei = erc20_balance_of(FLAPJAX_TOKEN, target_wallet, "latest", rpc_url)
+    bnb_wei = int(rpc_call("eth_getBalance", [target_wallet, "latest"], rpc_url), 16)
+    return {
+        "wallet": target_wallet,
+        "receipts_checked": len(results),
+        "all_valid": all(r.get("valid") for r in results) if results else True,
+        "total_verified_fj": total_verified_wei / 1e18,
+        "live_balance_fj": bal_wei / 1e18,
+        "live_balance_bnb": bnb_wei / 1e18,
+        "holder_eligible": bal_wei >= (10**18),
+        "retention_pct": round((bal_wei / total_verified_wei) * 100, 2) if total_verified_wei > 0 else 100.0,
+        "receipts": results,
+    }
 
 
 def extract_dispatcher_push4(code_hex):
@@ -191,45 +259,42 @@ def extract_dispatcher_push4(code_hex):
 def cmd_state(args):
     blk_hex = hex(args.block) if args.block else rpc_call("eth_blockNumber", [], args.rpc)
     blk_num = int(blk_hex, 16)
+    target_wallet = (args.wallet or ARISPAY_WALLET).lower()
     treasury_fj = erc20_balance_of(FLAPJAX_TOKEN, TREASURY, blk_hex, args.rpc)
     treasury_bnb = int(rpc_call("eth_getBalance", [TREASURY, blk_hex], args.rpc), 16)
-    aris_fj = erc20_balance_of(FLAPJAX_TOKEN, ARISPAY_WALLET, blk_hex, args.rpc)
+    wallet_fj = erc20_balance_of(FLAPJAX_TOKEN, target_wallet, blk_hex, args.rpc)
     s0 = decode_slot0(rpc_call("eth_call", [{"to": POOL_V3_WBNB, "data": "0x3850c7bd"}, blk_hex], args.rpc))
     liq = int(rpc_call("eth_call", [{"to": POOL_V3_WBNB, "data": "0x1a686502"}, blk_hex], args.rpc), 16)
     depth_wbnb = compute_two_percent_wbnb_depth(liq, s0["sqrtPriceX96"])
+    lock_data = "0xf4dadc61" + hex(101)[2:].rjust(64, "0")
+    lock_101 = decode_goplus_lock(rpc_call("eth_call", [{"to": GOPLUS_LOCKER, "data": lock_data}, blk_hex], args.rpc))
     report = {
         "block": blk_num,
         "treasury_flapjax": treasury_fj / 1e18,
         "treasury_bnb": treasury_bnb / 1e18,
-        "arispay_wallet_flapjax": aris_fj / 1e18,
+        "wallet": target_wallet,
+        "wallet_flapjax": wallet_fj / 1e18,
         "pool_v3_wbnb": {
             "tick": s0["tick"],
+            "sqrtPriceX96": s0["sqrtPriceX96"],
             "liquidity": liq,
             "two_percent_depth_wbnb": round(depth_wbnb, 8),
         },
+        "goplus_lock_101": lock_101,
     }
     report["receipt_sha256"] = hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
     print(json.dumps(report, indent=2))
 
 
 def cmd_receipts(args):
-    results = []
-    total_verified = 0
-    for item in ARISPAY_SETTLED_RECEIPTS:
-        chk = verify_transfer_receipt(item["tx"], ARISPAY_WALLET, item["amount_fj"] * (10**18), args.rpc)
-        results.append({**item, **chk})
-        if chk.get("valid"):
-            total_verified += item["amount_fj"]
-    bal_wei = erc20_balance_of(FLAPJAX_TOKEN, ARISPAY_WALLET, "latest", args.rpc)
-    summary = {
-        "wallet": ARISPAY_WALLET,
-        "receipts_checked": len(results),
-        "all_valid": all(r.get("valid") for r in results),
-        "total_verified_fj": total_verified,
-        "live_balance_fj": bal_wei // (10**18),
-        "retention_pct": round((bal_wei / (total_verified * (10**18))) * 100, 2) if total_verified else 0,
-        "receipts": results,
-    }
+    tx_list = None
+    if args.txs:
+        tx_list = [x.strip() for x in args.txs.split(",") if x.strip()]
+    elif args.txs_file:
+        with open(args.txs_file, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+            tx_list = json.loads(raw) if raw.startswith("[") else [x.strip() for x in raw.splitlines() if x.strip()]
+    summary = verify_wallet_and_txs(wallet=args.wallet, tx_list=tx_list, rpc_url=args.rpc)
     print(json.dumps(summary, indent=2))
 
 
@@ -237,6 +302,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="FlapJax On-Chain Verifier (Read-Only Stdlib CLI)")
     parser.add_argument("command", nargs="?", default="state", choices=["state", "receipts"])
     parser.add_argument("--block", type=int, default=None, help="Optional block number")
+    parser.add_argument("--wallet", type=str, default=None, help="Target BSC wallet address (defaults to @arispay-x402 wallet)")
+    parser.add_argument("--txs", type=str, default=None, help="Comma-separated list of BSC transaction hashes to verify")
+    parser.add_argument("--txs-file", type=str, default=None, help="Path to JSON or newline-delimited file of tx hashes")
     parser.add_argument("--rpc", type=str, default=None, help="Optional custom BSC RPC URL")
     args = parser.parse_args(argv)
     if args.command == "state":
