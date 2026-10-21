@@ -67,11 +67,11 @@ async function main() {
     throw new Error(`GoPlus locks(101) mismatch: nftId=${nftId} endTime=${endTime}`);
   }
 
-  // Verify +2% WBNB depth formula with pool sqrtPriceX96 = 1627163852510051447001980
+  // Verify +2% WBNB depth formula with pool sqrtPriceX96 = 1629889992343898313577613 (0.065644 WBNB) and 1627163852510051447001980 (0.065534 WBNB)
   const liq = 320678316678999036604866;
-  const sqrtP = 1627163852510051447001980;
+  const sqrtP = 1629889992343898313577613;
   const depthWbnb = (liq * (sqrtP / Math.pow(2, 96)) * (Math.sqrt(1.02) - 1)) / 1e18;
-  if (Math.abs(depthWbnb - 0.06564) > 0.0001) {
+  if (Math.abs(depthWbnb - 0.065644) > 0.00001) {
     throw new Error(`Depth fixture mismatch: ${depthWbnb}`);
   }
 
